@@ -15,22 +15,11 @@ local file_exists = tools.file_exists
 local download_file = tools.download_file
 local batch_path = tools.windows_cmd_quote
 
-local function write_windows_phar_wrapper(wrapper_path, php_bin, phar_name, after_success_script)
-    local content = '@echo off\r\n' ..
-        string.format('%s "%%~dp0%s" %%*\r\n', batch_path(php_bin), phar_name)
-
-    if after_success_script ~= nil and after_success_script ~= "" then
-        content = content ..
-            'set "MISE_PHP_EXIT_CODE=%ERRORLEVEL%"\r\n' ..
-            string.format(
-                'if "%%MISE_PHP_EXIT_CODE%%"=="0" %s "%%~dp0%s" >NUL 2>&1\r\n',
-                batch_path(php_bin),
-                after_success_script
-            ) ..
-            'exit /b %MISE_PHP_EXIT_CODE%\r\n'
-    end
-
-    return tools.write_file(wrapper_path, content)
+local function write_windows_phar_wrapper(wrapper_path, php_bin, phar_name)
+    return tools.write_file(
+        wrapper_path,
+        '@echo off\r\n' .. string.format('%s "%%~dp0%s" %%*\r\n', batch_path(php_bin), phar_name)
+    )
 end
 
 local function sanitize_log_part(value)
@@ -140,126 +129,6 @@ local function failed_packages_log_summary(failed_packages)
     end
 
     return summary
-end
-
-local function windows_pie_normalizer_script()
-    return [=[<?php
-declare(strict_types=1);
-
-$phpPath = realpath(__DIR__ . DIRECTORY_SEPARATOR . 'php.exe') ?: (__DIR__ . DIRECTORY_SEPARATOR . 'php.exe');
-$extensionDir = ini_get('extension_dir') ?: (__DIR__ . DIRECTORY_SEPARATOR . 'ext');
-$extensionDir = rtrim((string) $extensionDir, "\\/");
-$pieRoot = getenv('APPDATA') ? getenv('APPDATA') . DIRECTORY_SEPARATOR . 'PIE' : null;
-
-if ($pieRoot === null || ! is_dir($pieRoot) || ! is_dir($extensionDir)) {
-    exit(0);
-}
-
-$normalizePath = static function (string $path): string {
-    $real = realpath($path);
-    $path = $real !== false ? $real : $path;
-    return strtolower(str_replace(['/', '\\'], DIRECTORY_SEPARATOR, $path));
-};
-
-$phpPathNormalized = $normalizePath($phpPath);
-$extensionDirNormalized = $normalizePath($extensionDir);
-$iniPath = php_ini_loaded_file() ?: null;
-$iniContent = $iniPath !== null && is_file($iniPath) ? file_get_contents($iniPath) : false;
-$iniChanged = false;
-
-$iterator = new RecursiveIteratorIterator(
-    new RecursiveDirectoryIterator($pieRoot, FilesystemIterator::SKIP_DOTS)
-);
-
-foreach ($iterator as $file) {
-    if ($file->getFilename() !== 'installed.json') {
-        continue;
-    }
-
-    $jsonPath = $file->getPathname();
-    $json = json_decode((string) file_get_contents($jsonPath), true);
-
-    if (! is_array($json) || ! isset($json['packages']) || ! is_array($json['packages'])) {
-        continue;
-    }
-
-    $changed = false;
-
-    foreach ($json['packages'] as &$package) {
-        if (! isset($package['extra']) || ! is_array($package['extra'])) {
-            continue;
-        }
-
-        $extra = &$package['extra'];
-        $targetPhp = $extra['pie-target-platform-php-path'] ?? null;
-        $installedBinary = $extra['pie-installed-binary'] ?? null;
-
-        if (! is_string($targetPhp) || ! is_string($installedBinary)) {
-            continue;
-        }
-
-        if ($normalizePath($targetPhp) !== $phpPathNormalized) {
-            continue;
-        }
-
-        if (! is_file($installedBinary)) {
-            continue;
-        }
-
-        $binaryDirectory = dirname($installedBinary);
-        if ($normalizePath($binaryDirectory) !== $extensionDirNormalized) {
-            continue;
-        }
-
-        $binaryName = basename($installedBinary);
-        if (! preg_match('/^php_([A-Za-z0-9_]+)\.dll$/', $binaryName, $matches)) {
-            continue;
-        }
-
-        $extensionName = strtolower($matches[1]);
-        $aliasBinary = $extensionDir . DIRECTORY_SEPARATOR . $extensionName . '.dll';
-
-        if (! is_file($aliasBinary) || hash_file('sha256', $aliasBinary) !== hash_file('sha256', $installedBinary)) {
-            copy($installedBinary, $aliasBinary);
-        }
-
-        $sourcePdb = preg_replace('/\.dll$/i', '.pdb', $installedBinary);
-        $aliasPdb = preg_replace('/\.dll$/i', '.pdb', $aliasBinary);
-        if (is_string($sourcePdb) && is_string($aliasPdb) && is_file($sourcePdb) && ! is_file($aliasPdb)) {
-            copy($sourcePdb, $aliasPdb);
-        }
-
-        if (($extra['pie-installed-binary'] ?? null) !== $aliasBinary) {
-            $extra['pie-installed-binary'] = $aliasBinary;
-            $changed = true;
-        }
-
-        if ($iniContent !== false) {
-            $pattern = '/^(\s*(?:zend_extension|extension)\s*=\s*)"?' . preg_quote($extensionName, '/') . '"?\s*$/mi';
-            $replacement = '$1' . $extensionName . '.dll';
-            $updatedIni = preg_replace($pattern, $replacement, $iniContent);
-
-            if (is_string($updatedIni) && $updatedIni !== $iniContent) {
-                $iniContent = $updatedIni;
-                $iniChanged = true;
-            }
-        }
-    }
-    unset($package);
-
-    if ($changed) {
-        file_put_contents(
-            $jsonPath,
-            json_encode($json, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . PHP_EOL,
-            LOCK_EX
-        );
-    }
-}
-
-if ($iniChanged && $iniPath !== null && is_string($iniContent)) {
-    file_put_contents($iniPath, $iniContent, LOCK_EX);
-}
-]=]
 end
 
 function packages.has_extension_requests()
@@ -438,7 +307,6 @@ function packages.install_pie_for_windows(sdkPath, version)
     local php_bin  = join_path(sdkPath, "php.exe")
     local pie_phar = join_path(sdkPath, "pie.phar")
     local pie_bat  = join_path(sdkPath, "pie.bat")
-    local pie_normalizer = join_path(sdkPath, "pie-normalize-windows.php")
 
     -- Download PIE PHAR
     local ok, err = download_file("https://github.com/php/pie/releases/latest/download/pie.phar", pie_phar)
@@ -452,18 +320,9 @@ function packages.install_pie_for_windows(sdkPath, version)
         return false
     end
 
-    if not tools.write_file(pie_normalizer, windows_pie_normalizer_script()) then
-        io.stderr:write(
-            "\27[93mWarning:\27[0m Failed to create PIE Windows normalizer.\n" ..
-            messages.verbose_tip(version) ..
-            messages.see("pie-verification-may-fail-or-time-out")
-        )
-        return false
-    end
-
-    -- Create PIE wrapper. The normalizer keeps PIE's Windows metadata in sync
-    -- with DLL names copied from prebuilt extension archives.
-    if not write_windows_phar_wrapper(pie_bat, php_bin, "pie.phar", "pie-normalize-windows.php") then
+    -- Create PIE wrapper. This .bat is the runtime shim users invoke; no
+    -- temporary command runner files are created.
+    if not write_windows_phar_wrapper(pie_bat, php_bin, "pie.phar") then
         io.stderr:write(
             "\27[93mWarning:\27[0m Failed to create PIE wrapper.\n" ..
             messages.verbose_tip(version) ..
